@@ -2,75 +2,122 @@ import express from "express";
 import Firm from "../models/Firm";
 import Transaction from "../models/Transaction";
 import authenticate from "../middleware/authenticate";
+import { getFinancialYearRange } from "../helpers";
 
 const router = express.Router();
 
-// Get all firms for the authenticated user
-router.get("/", authenticate, async (req, res): Promise<any> => {
-  try {
-    const userId = req.body.userDetails.id; // Use userId from userDetails
+import { Request as ExpressRequest, Response } from "express";
 
-    // Fetch the firms for the user
-    const firms = await Firm.find({ userId });
+interface AuthenticatedRequest extends ExpressRequest {
+  body: {
+    userDetails: {
+      id: number;
+    };
+  };
+}
 
-    // Fetch all transactions for the user
-    const transactions = await Transaction.find({ userId });
+router.get(
+  "/",
+  authenticate,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      const userId = req.body.userDetails.id;
+      const financialYear = req.query.financialYear as string | undefined;
 
-    // Function to calculate the balance and totals based on transactions
-    const calculateBalanceAndTotals = (firmId: number) => {
-      // Filter transactions for the specific firmId
-      const firmTransactions = transactions.filter(
-        (tx) => Number(tx.firmId) === firmId // Ensure firmId is a number for comparison
-      );
+      const { startOfFY, endOfFY } = getFinancialYearRange(financialYear);
 
-      let balance = 0;
-      let totalSale = 0;
-      let totalPurchase = 0;
-      let totalWithdraw = 0;
-      let totalDeposit = 0;
+      const firms = await Firm.find({ userId });
 
-      // Calculate balance and totals for each transaction type
-      firmTransactions.forEach((tx) => {
-        if (tx.type === "sale" || tx.type === "withdrawal") {
-          balance += tx.amount;
-          if (tx.type === "sale") totalSale += tx.amount;
-          if (tx.type === "withdrawal") totalWithdraw += tx.amount;
-        } else if (tx.type === "purchase" || tx.type === "deposit") {
-          balance -= tx.amount;
-          if (tx.type === "purchase") totalPurchase += tx.amount;
-          if (tx.type === "deposit") totalDeposit += tx.amount;
-        }
+      const transactions = await Transaction.find({
+        userId,
+        date: {
+          $gte: startOfFY,
+          $lte: endOfFY,
+        },
       });
 
-      return { balance, totalSale, totalPurchase, totalWithdraw, totalDeposit };
-    };
+      const calculateBalanceAndTotals = async (firmId: number) => {
+        const firmTransactions = transactions.filter(
+          (tx) => Number(tx.firmId) === firmId
+        );
 
-    // Prepare the firms data with calculated values
-    const updatedFirms = firms.map((firm) => {
-      const { balance, totalSale, totalPurchase, totalWithdraw, totalDeposit } =
-        calculateBalanceAndTotals(firm.id); // Calculate all values for the firm
+        const previousTransactions = await Transaction.find({
+          firmId,
+          userId,
+          date: { $lt: startOfFY },
+        });
 
-      return {
-        ...firm.toObject(), // Convert firm to plain object
-        balance, // Add calculated balance
-        balanceType: balance > 0 ? "collect" : "pay", // Set balanceType
-        totalSale,
-        totalPurchase,
-        totalWithdraw,
-        totalDeposit,
+        const lastYearBalance = previousTransactions.reduce((balance, tx) => {
+          if (tx.type === "sale" || tx.type === "withdrawal") {
+            return balance + tx.amount;
+          } else if (tx.type === "purchase" || tx.type === "deposit") {
+            return balance - tx.amount;
+          }
+          return balance;
+        }, 0);
+
+        let balance = 0;
+        let totalSale = 0;
+        let totalPurchase = 0;
+        let totalWithdraw = 0;
+        let totalDeposit = 0;
+
+        firmTransactions.forEach((tx) => {
+          if (tx.type === "sale" || tx.type === "withdrawal") {
+            balance += tx.amount;
+            if (tx.type === "sale") totalSale += tx.amount;
+            if (tx.type === "withdrawal") totalWithdraw += tx.amount;
+          } else if (tx.type === "purchase" || tx.type === "deposit") {
+            balance -= tx.amount;
+            if (tx.type === "purchase") totalPurchase += tx.amount;
+            if (tx.type === "deposit") totalDeposit += tx.amount;
+          }
+        });
+
+        return {
+          balance: balance + lastYearBalance,
+          totalSale,
+          totalPurchase,
+          totalWithdraw,
+          totalDeposit,
+        };
       };
-    });
 
-    res.json({
-      data: updatedFirms,
-      message: "Firms and balances with totals fetched successfully.",
-    });
-  } catch (error) {
-    res
-      .status(500)
-      .json({ message: "Error fetching firms and calculating balance", error });
+      const updatedFirms = await Promise.all(
+        firms.map(async (firm) => {
+          const {
+            balance,
+            totalSale,
+            totalPurchase,
+            totalWithdraw,
+            totalDeposit,
+          } = await calculateBalanceAndTotals(firm.id);
+
+          return {
+            ...firm.toObject(),
+            balance,
+            balanceType: balance > 0 ? "collect" : "pay",
+            totalSale,
+            totalPurchase,
+            totalWithdraw,
+            totalDeposit,
+          };
+        })
+      );
+
+      res.json({
+        data: updatedFirms,
+        message: "Firms and balances with totals fetched successfully.",
+      });
+    } catch (error) {
+      console.error("Error fetching firms:", error);
+      res.status(500).json({
+        message: "Error fetching firms and calculating balance",
+        error,
+      });
+    }
   }
-});
+);
 
 // Get a single firm by ID for the authenticated user
 router.get("/:id", authenticate, async (req, res): Promise<any> => {

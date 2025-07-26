@@ -2,6 +2,7 @@ import express from "express";
 import Transaction from "../models/Transaction";
 import Firm from "../models/Firm";
 import authenticate from "../middleware/authenticate";
+import { getFinancialYearRange } from "../helpers";
 
 const router = express.Router();
 
@@ -86,41 +87,57 @@ router.get("/", authenticate, async (req, res) => {
   }
 });
 
-// Get all transactions for a specific firm of the authenticated user
 router.get("/:firmId", authenticate, async (req, res): Promise<any> => {
-  const firmId = parseInt(req.params.firmId); // Extract firmId from params
+  const firmId = parseInt(req.params.firmId);
+  const userId = req.body.userDetails.id;
+  const financialYear = req.query.financialYear as string | undefined;
+
   try {
-    const userId = req.body.userDetails.id; // Get userId from userDetails
+    const firm = await Firm.findOne({ id: firmId, userId });
+    if (!firm) return res.status(404).json({ message: "Firm not found." });
 
-    // Fetch the firm details
-    const firm = await Firm.findOne({ id: firmId, userId }); // Filter firm by userId
+    // Get start and end of selected financial year (or default to current)
+    const { startOfFY, endOfFY } = getFinancialYearRange(financialYear);
 
-    if (!firm) {
-      return res.status(404).json({ message: "Firm not found." });
-    }
+    // Fetch transactions within selected FY
+    const transactions = await Transaction.find({
+      firmId,
+      userId,
+      date: { $gte: startOfFY, $lte: endOfFY },
+    });
 
-    // Fetch the transactions for the specific firm and user
-    const transactions = await Transaction.find({ firmId, userId });
+    // Fetch all transactions before the start of this FY (not current FY)
+    const previousTransactions = await Transaction.find({
+      firmId,
+      userId,
+      date: { $lt: startOfFY },
+    });
 
-    if (transactions.length > 0) {
-      // Add firm details to each transaction
-      const transactionsWithFirmDetails = transactions.map((transaction) => ({
-        ...transaction.toObject(), // Convert Mongoose document to plain object
-        firmDetails: firm, // Add the firm details to each transaction
-      }));
+    // Calculate opening balance from previous transactions
+    const lastYearBalance = previousTransactions.reduce((balance, tx) => {
+      if (tx.type === "sale" || tx.type === "withdrawal") {
+        return balance + tx.amount;
+      } else if (tx.type === "purchase" || tx.type === "deposit") {
+        return balance - tx.amount;
+      }
+      return balance;
+    }, 0);
 
-      res.json({
-        data: transactionsWithFirmDetails,
-        message: "Transactions fetched successfully.",
-      });
-    } else {
-      res.status(200).json({
-        data: [],
-        message: "No transactions found.",
-      });
-    }
+    // Attach firm info to each transaction
+    const transactionsWithFirmDetails = transactions.map((tx) => ({
+      ...tx.toObject(),
+      firmDetails: firm,
+    }));
+
+    return res.json({
+      financialYear: financialYear || "current",
+      lastYearBalance,
+      data: transactionsWithFirmDetails,
+      message: "Transactions fetched successfully.",
+    });
   } catch (error) {
-    res
+    console.error("Transaction fetch error:", error);
+    return res
       .status(500)
       .json({ message: "Error fetching firm or transactions.", error });
   }
